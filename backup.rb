@@ -10,12 +10,9 @@ require "active_support/all"
 require "reverse_markdown"
 require "progress_bar"
 
-target_directory = "episodes"
-
-FileUtils.mkdir_p(target_directory)
-
 RemoteEpisode =
   Struct.new(
+    :episode_number,
     :title,
     :description,
     :audio_url,
@@ -23,9 +20,36 @@ RemoteEpisode =
     :duration,
     :published_at,
     keyword_init: true
-  ) do
+  ) {
+    def self.from(source)
+      URI.open(source) do |rss|
+        RSS::Parser
+          .parse(rss)
+          .items
+          .sort_by(&:pubDate)
+          .map.with_index { |item, index|
+            RemoteEpisode.new(
+              episode_number: index + 1,
+              title: item.title,
+              description: item.description,
+              audio_url: item.enclosure.url,
+              duration: item.itunes_duration&.content,
+              published_at: item.pubDate
+            )
+          }
+      end
+    end
+
     def identifier
-      title.parameterize
+      "#{episode_number}-#{title.parameterize}"
+    end
+
+    def filename(extname)
+      "#{identifier}#{extname}"
+    end
+
+    def audio_format
+      File.extname(audio_url)
     end
 
     def content
@@ -43,64 +67,66 @@ RemoteEpisode =
         .convert(description)
         .gsub("&nbsp;", " ")
     end
+  }
+
+class Downloader
+  def push(source, target, &block)
+    request = Typhoeus::Request.new(source, followlocation: true)
+    target_file = File.open(target, "wb")
+
+    request.on_headers do |response|
+      if response.code != 200
+        puts "Request failed for episode #{source}"
+      end
+    end
+
+    request.on_body do |chunk|
+      target_file.write(chunk)
+    end
+
+    request.on_complete do |response|
+      target_file.close
+
+      block&.call
+    end
+
+    hydra.queue(request)
   end
+
+  def run
+    hydra.run
+  end
+
+  private
+
+  def hydra
+    @hydra ||= Typhoeus::Hydra.new(max_concurrency: 50)
+  end
+end
 
 puts "Preparing…"
 
+target_directory = "episodes"
+FileUtils.mkdir_p(target_directory)
+
 episodes =
-  URI.open("https://feeds.acast.com/public/shows/5af195bb77c1746339e08ab6") do |rss|
-    episodes =
-      RSS::Parser.parse(rss).items.map { |item|
-        RemoteEpisode.new(
-          title: item.title,
-          description: item.description,
-          audio_url: item.enclosure.url,
-          duration: item.itunes_duration&.content,
-          published_at: item.pubDate
-        )
-      }
-  end
+  RemoteEpisode.from(
+    "https://feeds.acast.com/public/shows/5af195bb77c1746339e08ab6"
+  )
+progress = ProgressBar.new(episodes.size + 1)
+downloader = Downloader.new
+
+episodes.each do |episode|
+  text_target_location =
+    File.join(target_directory, episode.filename(".txt"))
+  audio_target_location =
+    File.join(target_directory, episode.filename(episode.audio_format))
+
+  File.write(text_target_location, episode.content)
+  downloader
+    .push(episode.audio_url, audio_target_location) { progress.increment! }
+end
 
 puts "— Episodes information read, downloading."
 
-progress = ProgressBar.new(episodes.size)
-hydra = Typhoeus::Hydra.new(max_concurrency: 50)
-
-episodes.sort_by(&:published_at).each_with_index do |episode, index|
-  filename = "#{index + 1}-#{episode.identifier}"
-  File.write(
-    File.join(target_directory, "#{filename}.txt"),
-    episode.content
-  )
-
-  audio_request = Typhoeus::Request.new(episode.audio_url, followlocation: true)
-
-  audio_file =
-    File.open(
-      File.join(
-        target_directory,
-        "#{filename}#{File.extname(episode.audio_url)}"
-      ),
-      "wb"
-    )
-
-  audio_request.on_headers do |response|
-    if response.code != 200
-      puts "Request failed for episode #{episode.identifier}"
-    end
-  end
-
-  audio_request.on_body do |chunk|
-    audio_file.write(chunk)
-  end
-
-  audio_request.on_complete do |response|
-    progress.increment!
-
-    audio_file.close
-  end
-
-  hydra.queue audio_request
-end
-
-hydra.run
+downloader.run
